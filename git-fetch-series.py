@@ -1,17 +1,24 @@
 #!/usr/bin/env python
 from argparse import ArgumentParser
-from nntplib import NNTP
+from nntplib import NNTP, NNTPError
 from collections import namedtuple
 from email.utils import parseaddr, parsedate
 from email.header import make_header
 from time import mktime, ctime
+from sys import stdout, stderr
 
 import re
 
 Message = namedtuple('Message', ['number', 'subject', 'poster', 'date', 'msg_id', 'references'])
 
-def limit(enum, limit=100):
-    for c, x in enumerate(enum):
+class FatalError(RuntimeError):
+    pass
+
+def limit(generator, limit):
+    """
+        return only the first limit items from the given generator
+    """
+    for c, x in enumerate(generator):
         if c > limit: raise StopIteration
         yield x
 
@@ -30,10 +37,9 @@ class Thread(object):
             >>> subject_identifier("Re: [PATCH v2 1/2] do that better")
             Re: [PATCH v2 X/X]
 
-            Messages are only considered part of the patch-set if they have
-            the same subject_identifier
+            Importantly, adding a Re: should break the sequence.
         """
-        return re.sub(r"[0-9]+", "X", msg.subject.split("]")[0] + "]")
+        return re.sub(r"[0-9]+/", "X/", msg.subject.split("]")[0] + "]")
 
     @staticmethod
     def sortkey(msg):
@@ -47,7 +53,7 @@ class Thread(object):
             >>> sortkey("[PATCH 9/10]")
             ["[PATCH ", 9, "/", 10, "]"]
         """
-        splits = re.split(r"([0-9]+)", msg.subject.split("]")[0] + "]")
+        splits = re.split(r"([0-9]+)", msg.subject)
 
         for x in range(1, len(splits), 2):
             splits[x] = int(splits[x])
@@ -64,6 +70,10 @@ class Thread(object):
     def should_include(self, msg):
         """
             Should this message be appended to this thread?
+
+            TODO: This logic is a bit "meh", it would be nice to support
+            numbered sequences of patches with the threading a bit squiffy,
+            as well as well-threaded sets of patches with no numbers.
         """
         return (msg.poster == self.first.poster and
                self.subject_identifier(msg) == self.thread_identifier and
@@ -81,45 +91,105 @@ class Thread(object):
 class Archive(object):
 
     @staticmethod
-    def get_email(header):
-        return parseaddr(header)[1]
-
-    @staticmethod
-    def get_ctime(header):
-        return 
+    def is_diff(body):
+        return bool([line for line in body if line.startswith("diff ")])
 
     def __init__(self, group, server):
         self.conn = NNTP(server)
         resp, count, first, last, name = self.conn.group(group)
 
+        self.group = group
+        self.server = server
         self.first = int(first)
         self.last = int(last)
 
-    def get_patch_series(self, start_id):
-        start_id = int(start_id)
+    def get_number_from_user(self, msg_id):
+        """
+            Convert something the user might input into a message id.
 
-        messages = limit(self.messages_starting_from(start_id), 100)
-        thread = Thread(messages.next())
+            These are:
+            # An NNTP message number
+            # A gmane link that includes the NNTP message number
+            # The original Message-Id header of the message.
+
+            NOTE: gmane's doesn't include the message number in STAT requests
+            that involve only the Message-Id (hence the convolution of getting
+            all the headers).
+        """
+        msg_id = re.sub(r".*gmane.org/gmane.comp.version-control.git/([0-9]+).*", r"\1", str(msg_id))
+        _, n, id, result = self.conn.head(msg_id)
+
+        for header in result:
+            m = re.match(r"Xref: .*:([0-9]+)\s*$", header, re.I)
+            if m:
+                return int(m.group(1))
+        else:
+            raise FatalError("No (or bad) Xref header for message '%s'" % msg_id)
+
+    def get_patch_series(self, user_input, search_limit=100):
+        """
+            Given an NNTP message number or a Message-Id header return
+            an mbox containing the patches introduced by the author of that message.
+
+            This handles the case where the threading is right *and* the patches
+            are numbered in a simple scheme:
+
+            [PATCH] this patch has no replies and stands on its own
+
+            [PATCH 0/2] this is an introduction to the series
+              |- [PATCH 1/2] the first commit
+              |- [PATCH 2/2] the second commit
+
+            [PATCH 1/3] this is the first commit
+              |- [PATCH 2/3] and this is the second
+                   |- [PATCH 3/3] and this is the third
+
+            TODO: it would be nice to make the search more efficient, we can
+            use the numbers in [PATCH <foo>/<bar>] to stop early.
+        """
+
+        start_id = self.get_number_from_user(user_input)
+
+        messages = limit(self.messages_starting_from(start_id), search_limit)
+        try:
+            thread = Thread(messages.next())
+        except StopIteration:
+            raise FatalError("No message at id '%s' using XOVER")
 
         n_since_last = 0
         for message in messages:
-            if thread.should_include(message):
+            if n_since_last > 5:
+                break
+
+            elif thread.should_include(message):
                 n_since_last = 0
                 thread.append(message)
-
-            elif n_since_last > 5:
-                break
 
             else:
                 n_since_last += 1
 
         else:
-            raise RuntimeError('did not find end of thread in reasonable time')
+            raise FatalError('did not find end of series within %s messages', search_limit)
 
+        for message in self.xover(start_id - 5, start_id -1):
+            if thread.should_include(message):
+                thread.append(message)
+
+        return self.mboxify(thread)
+
+    def mboxify(self, thread):
+        """
+            Convert a thread into an mbox for application via git-am.
+        """
         lines = []
 
         for message in thread.in_order():
             _, number, msg_id, body = self.conn.body(str(message.number))
+
+            # git-am doesn't like empty patches very much, and the 0/X'th patch is
+            # often not a patch, we skip it here. (TODO, warn the user about this)
+            if re.search(r" 0+/[0-9]+", message.subject) and not self.is_diff(body):
+                continue
 
             poster = parseaddr(message.poster)[0]
             date = ctime(mktime(parsedate(message.date)))
@@ -129,6 +199,7 @@ class Archive(object):
             lines.append("Subject: %s" % message.subject)
             lines.append("Date: %s" % message.date)
             lines.append("Message-Id: %s" % message.msg_id)
+            lines.append("Xref: %s %s:%s" % (self.server, self.group, message.number))
             lines.append("References: %s" % "\n\t".join(message.references))
             lines.append("")
             lines += body
@@ -140,44 +211,53 @@ class Archive(object):
         """
             Generate all message headers starting from the given id and working upwards.
         """
-
         while start_id < self.last:
             next_id = min(start_id + 20, self.last)
-
-            _, result = self.conn.xover(str(start_id), str(next_id))
-
-            result.sort(key=lambda x: int(x[0]))
-
-            for (number, subject, poster, date, msg_id, references, size, lines)  in result:
-                yield Message(int(number), subject, poster, date, msg_id, references)
+            for message in self.xover(start_id, next_id):
+                yield message
 
             start_id = next_id + 1
 
-def main():
+    def xover(self, begin, end):
+        """
+            Get the headers for the messages with numbers between begin and end.
+        """
+        if begin == end:
+            return []
 
+        _, result = self.conn.xover(str(min(begin, end)), str(max(begin, end)))
+
+        result = [Message(int(number), subject, poster, date, msg_id, references) for
+                  (number, subject, poster, date, msg_id, references, size, lines) in result]
+
+        return sorted(result, key=lambda x: x.number)
+
+def main():
     parser = ArgumentParser(description="""
         git fetch-series downloads a patch series from usenet.
-
-        It's only been tested with news.gmane.org's archive of gmane.comp.version-control.git,
-        though in principal it could work with any archive that ensures all responses to a message
-        appear after the message itself.
     """, epilog="""
-    If your usenet server is hard to connect to, set up a netrc(5) file.
-    """)
+    NOTE: If your usenet server is hard to connect to, set up a netrc(5) file.
+    """, prog="git get-series",
+    usage="git fetch-series [-s SERVER] [-n NEWSGROUP] ID | git am")
 
-    parser.add_argument('-s', '--server', action='store', default='news.gmane.org',
+    parser.add_argument('-s', '--server', default='news.gmane.org',
             help="Which news server to connect to.")
-    parser.add_argument('-n', '--newsgroup', action='store', default='gmane.comp.version-control.git',
+    parser.add_argument('-n', '--newsgroup', default='gmane.comp.version-control.git',
             help="Which newsgroup to read out of")
-    parser.add_argument('id',
-            help="The message id or number of the first message in the patch series")
+    parser.add_argument('id', help="The message id or number of the first message in the patch series")
+
 
     opts = parser.parse_args()
 
-    a = Archive(opts.newsgroup, opts.server)
-
-    print a.get_patch_series(opts.id)
-
+    try:
+        a = Archive(opts.newsgroup, opts.server)
+        print a.get_patch_series(opts.id)
+    except NNTPError as e:
+        stderr.write("NNTP %s: %s\n" % (opts.server, e.message))
+    except FatalError as e:
+        stderr.write("fatal: %s\n" % e.message)
+    except KeyboardInterrupt:
+        pass
 
 if __name__  == "__main__":
     main()
